@@ -7,9 +7,9 @@
 
 # restyoops
 
-Oops! See if restyv2 response is retryable.
+Oops! Decide whether a failed resty request is worth sending again.
 
-Structured HTTP operation fault classification with retryable semantics, designed with go-resty/resty/v2.
+Retry judgement for `go-resty/resty/v2`: whether to send it again, how long to hold off, and what kind of fault it was.
 
 ---
 
@@ -19,15 +19,27 @@ Structured HTTP operation fault classification with retryable semantics, designe
 
 [中文说明](README.zh.md)
 
-<!-- TEMPLATE (EN) END: LANGUAGE NAVIGATION -->
+<!-- TEMPLATE (EN) CLOSE: LANGUAGE NAVIGATION -->
 
-## Main Features
+## The Problem
 
-🎯 **Fault Classification**: Categorize HTTP response outcomes into actionable categories
-⚡ **Retryable Detection**: Determine if an operation is retryable with sensible defaults
-🔄 **Configurable Settings**: Customize settings based on status code and kind
-🔍 **Content Checks**: Custom content checks handling unique cases (captcha, WAF, business codes)
-⏱️ **Wait Time**: Suggested wait duration before retrying
+resty already owns a retry loop, an exponential backoff and the attempt counting. What it leaves to its users is the judgement, and left alone that judgement goes wrong in ways that are easy to miss.
+
+Each row below comes from a test in this repo, run against resty v2.17.2:
+
+| What happens | resty on its own |
+| ------------ | ---------------- |
+| `SetRetryCount(3)` and the peer answers `500` | The peer is reached **once**. Status codes are never repeated |
+| The connection is refused | Repeated 4 times ✅ |
+| `AddRetryAfterErrorCondition()` added, then the connection is refused | Repeated **0** times. resty's own helper silences retries on transport faults |
+| Same helper, and the peer answers `404` | Reached **4** times, hammering a peer over a resource that stays absent |
+| The peer answers `429` with `Retry-After: 120` | Goes again after **102ms**. The header is never read |
+| An untrusted certificate | Repeated 4 times, though no certificate becomes trusted through repetition |
+| `POST` answered with `500` | Repeated, though the order behind it may already have been placed |
+
+The reason the third row happens: resty starts each round assuming a transport fault repeats, then lets **every** condition overwrite that assumption. One condition answering "no" silences it entirely.
+
+This package supplies the judgement, installs it in one call, and reports each fault as an error carrying its classification.
 
 ## Installation
 
@@ -41,161 +53,125 @@ go get github.com/yylego/restyoops
 package main
 
 import (
+    "errors"
     "fmt"
+
     "github.com/go-resty/resty/v2"
     "github.com/yylego/restyoops"
 )
 
 func main() {
-    client := resty.New()
+    client := restyoops.Setup(resty.New())
 
-    detective := restyoops.NewDetective(restyoops.NewConfig())
-    resp, oops := detective.Detect(client.R().Get("https://api.example.com/data"))
-
-    if oops != nil {
-        fmt.Printf("Kind: %s, Retryable: %v\n", oops.Kind, oops.Retryable)
-        if oops.IsRetryable() {
-            fmt.Printf("Wait before retrying: %v\n", oops.WaitTime)
+    resp, err := client.R().Get("https://api.example.com/data")
+    if err != nil {
+        var oops *restyoops.Oops
+        if errors.As(err, &oops) {
+            fmt.Println(oops.Kind, oops.StatusCode, oops.Attempt, oops.Retryable)
         }
         return
     }
 
-    fmt.Println("Request success!")
-    fmt.Println("Response:", string(resp.Body()))
+    fmt.Println("success:", string(resp.Body()))
 }
 ```
 
-## Detective (Recommended)
+`Setup` installs the policy onto the client once. Every call site stays ordinary Go: one `if err != nil` catches transport faults and fault status codes alike, and `errors.As` reaches the classification when it is wanted.
 
-`Detective` wraps config and provides a convenient API that accepts resty's values without intermediate steps:
+## What The Defaults Decide
+
+**Transport faults**
+
+| Fault | Kind | Send again | Why |
+| ----- | ---- | ---------- | --- |
+| Connection refused, reset, unreachable | `KindNetwork` | yes | The peer may come back |
+| Timeout, deadline exceeded | `KindNetwork` | yes | Time running out often clears up |
+| Context canceled | `KindCanceled` | no | The context is dead, another attempt dies at once |
+| Name does not resolve | `KindRequest` | no | Absent names stay absent |
+| Unsupported scheme, no host, too many redirects | `KindRequest` | no | The request itself can never get past this |
+| Untrusted certificate, denied handshake | `KindTLS` | no | Trust does not arrive through repetition |
+| Anything unrecognized | `KindUnknown` | no | Better than hammering a peer over an unknown shape |
+
+**Status codes**
+
+| Status | Kind | Send again |
+| ------ | ---- | ---------- |
+| 408, 425 | `KindClient` | yes |
+| 429 | `KindThrottle` | yes, holding off as `Retry-After` asks |
+| 500, 502, 503, 504, other 5xx | `KindUpstream` | yes |
+| 501, 505 | `KindUpstream` | no |
+| 400, 401, 403, 404, other 4xx | `KindClient` | no |
+| below 400 | — | not a fault, `Detect` returns nil |
+
+**Repeats that are not safe.** A method outside `GET HEAD OPTIONS TRACE PUT DELETE` may already have taken effect, and no status code can tell whether it did. Such a method is not repeated, with one exception: `429` means the peer turned the request away without acting on it, so repeating it is safe. `WithRepeatMethods` takes that decision back.
+
+**Kinds a custom check can report.** `KindBlock` (captcha, WAF, login redirect), `KindBusiness` (a fault code inside a 200), `KindParse`. The built-in detection never produces these, since recognizing them needs knowledge about the peer. `Kind` is an open type, so a kind of your own works the same way.
+
+## Configuration
 
 ```go
-type OopsIssue = Oops
-
-detective := restyoops.NewDetective(restyoops.NewConfig())
-resp, oops := detective.Detect(client.R().Get(url))  // No need: resp, err := ...; then Detect(..., resp, err)
-if oops != nil {
-    // handle issue
-    return
-}
-// success
-data := resp.Body()
+client := restyoops.Setup(resty.New(),
+    restyoops.WithAttempts(3),                          // attempts after the first
+    restyoops.WithWaitTime(100*time.Millisecond, 30*time.Second),
+    restyoops.WithStatus(403, restyoops.Again(5*time.Second)),
+    restyoops.WithKind(restyoops.KindUpstream, restyoops.Abort()),
+    restyoops.WithRepeatMethods("GET", "HEAD", "POST"),
+    restyoops.WithErrorOnFault(false),                  // keep resty's shape: a 500 arrives with a nil error
+)
 ```
 
-**Advantage**: Avoids the `resp, err := client.R().Get(url)` then `Detect(cfg, resp, err)` pattern.
+`Again()` hands the wait to the backoff, which grows it with each attempt. `Again(d)` states the wait, which then stays flat. `Abort()` refuses another attempt. A stated wait is kept as stated, including a stated zero — though resty raises any wait up to the floor set through `WithWaitTime`, which is a limit this package cannot lift.
 
-## Kind Classification
+Precedence: a custom check outranks everything, then a rule pinned to one status code, then a rule covering a kind, then the built-in decision.
 
-| Kind           | Description                              | Default Retryable |
-| -------------- | ---------------------------------------- | ----------------- |
-| `KindNetwork`  | Network issues (timeout, DNS, TCP, TLS)  | true              |
-| `KindHttp`     | HTTP 4xx/5xx status codes                | varies            |
-| `KindParse`    | Response parsing failed                  | false             |
-| `KindBlock`    | Request blocked (captcha, WAF)           | false             |
-| `KindBusiness` | Business logic issue (HTTP 200, code!=0) | false             |
-| `KindUnknown`  | Unclassified issues                      | false             |
+Two boundaries worth stating, so nothing configured turns out to be quietly inert. `WithStatus` and `WithKind` refine a verdict rather than create one: they reach status codes already counted as faults, meaning 400 and above. And they reach the built-in detection's verdicts, not what a check reports — a check saw the response itself, so its verdict stands as given. Turning a 200 or a 302 into a fault is what `WithCheck` is there for.
 
-**Note**: Success returns `nil` (no oops means no problem).
+## Custom Checks
 
-## Default HTTP Status Retryable
-
-| Status Code              | Retryable |
-| ------------------------ | --------- |
-| 408 Request Timeout      | true      |
-| 429 Too Many Requests    | true      |
-| 500 Internal Server Err  | true      |
-| 502 Bad Gateway          | true      |
-| 503 Service Unavailable  | true      |
-| 504 Gateway Timeout      | true      |
-| 400 Bad Request          | false     |
-| 401 Unauthorized         | false     |
-| 403 Forbidden            | false     |
-| 404 Not Found            | false     |
-| 409 Conflict             | false     |
-| 422 Unprocessable Entity | false     |
-| Other 5xx                | true      |
-| Other 4xx                | false     |
-
-## Custom Configuration
-
-### Config Precedence
-
-When detecting, configurations are applied in the following sequence (highest to lowest):
-
-1. **ContentChecks** - Custom content check functions (checked first)
-2. **StatusOptions** - Status code specific configuration
-3. **KindOptions** - Kind specific configuration
-4. **Default** - Built-in default values
-
-When a high-precedence config matches, others below it are skipped.
-
-### Customize Status Code Settings
+A check sees the whole response, so headers, payload and the request behind it are all reachable. Returning nil hands the decision back.
 
 ```go
-cfg := restyoops.NewConfig().
-    WithStatusRetryable(403, true, 5*time.Second).  // Make 403 retryable
-    WithStatusRetryable(500, false, 0)              // Make 500 not retryable
-
-oops := restyoops.Detect(cfg, resp, err)
-```
-
-### Customize Kind Settings
-
-```go
-cfg := restyoops.NewConfig().
-    WithKindRetryable(restyoops.KindNetwork, true, 10*time.Second)
-
-oops := restyoops.Detect(cfg, resp, err)
-```
-
-### Custom Content Check
-
-```go
-cfg := restyoops.NewConfig().
-    WithContentCheck(200, func(contentType string, content []byte) *restyoops.Oops {
-        if bytes.Contains(content, []byte("captcha")) {
-            return restyoops.NewOops(restyoops.KindBlock, 200, errors.New("CAPTCHA DETECTED"), true).WithWaitTime(5*time.Second)
+client := restyoops.Setup(resty.New(),
+    restyoops.WithCheck(func(resp *resty.Response, cause error) *restyoops.Oops {
+        if resp == nil || !bytes.Contains(resp.Body(), []byte("captcha")) {
+            return nil
         }
-        return nil // pass, continue default detection
-    })
-
-oops := restyoops.Detect(cfg, resp, err)
+        return restyoops.NewOops(restyoops.KindBlock,
+            errors.New("captcha page served"), restyoops.Abort())
+    }),
+)
 ```
 
-### Set Default Wait Time
+## Classifying Without Taking Over
+
+`Detect` answers what a finished call ran into, leaving the retrying alone. It reads what a resty call returns, and returns nil when nothing went wrong.
 
 ```go
-cfg := restyoops.NewConfig().
-    WithDefaultWait(2 * time.Second)
-
-oops := restyoops.Detect(cfg, resp, err)
+oops := restyoops.Detect(resty.New().R().Get(url))
+if oops != nil {
+    fmt.Println(oops.Kind, oops.Retryable, oops.WaitTime)
+}
 ```
 
-## Oops Struct
+Calling it again on its own output returns the same verdict, so it is safe anywhere in the flow.
+
+## Oops
 
 ```go
 type Oops struct {
-    Kind        Kind          // Classification
-    StatusCode  int           // HTTP status code
-    ContentType string        // Response Content-Type
-    Cause       error         // Wrapped cause (never nil)
-    Retryable   bool          // Can be resolved via retries
-    WaitTime    time.Duration // Suggested wait time
+    Kind        Kind          // Nature of the fault
+    StatusCode  int           // 0 when no response arrived
+    ContentType string
+    Method      string
+    URL         string
+    Attempt     int           // Which attempt produced it, counting from 1
+    Retryable   bool
+    WaitTime    time.Duration // 0 means the backoff decides
+    Cause       error         // nil when the status code says it much
 }
 ```
 
-## Detect Function (Basic API)
-
-```go
-func Detect(cfg *Config, resp *resty.Response, respCause error) *Oops
-```
-
-Usage:
-
-```go
-resp, err := client.R().Get(url)
-oops := restyoops.Detect(restyoops.NewConfig(), resp, err)
-```
+`Oops` is an error and unwraps to `Cause`, so `errors.Is` and `errors.As` both reach through it.
 
 ---
 
@@ -257,7 +233,7 @@ Welcome to contribute to this project via submitting merge requests and reportin
 
 **Have Fun Coding with this package!** 🎉🎉🎉
 
-<!-- TEMPLATE (EN) END: STANDARD PROJECT FOOTER -->
+<!-- TEMPLATE (EN) CLOSE: STANDARD PROJECT FOOTER -->
 
 ---
 

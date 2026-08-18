@@ -1,93 +1,102 @@
-// Package restyoops: Structured HTTP operation fault classification with retryable semantics
-// Oops! See if restyv2 response is retryable
-// Provides Kind enum, Oops struct, and Detect function to categorize HTTP response outcomes
-//
-// restyoops: 结构化 HTTP 操作故障分类，带有可重试语义
-// Oops! 检查 restyv2 响应是否可重试
-// 提供 Kind 枚举、Oops 结构体和 Detect 函数来分类 HTTP 响应结果
 package restyoops
 
-// Kind represents the classification of an HTTP operation outcome
-// Used to categorize outcomes into actionable groups
+// Kind names the nature of a request fault, so callers can branch on it
+// Each kind implies a different remedy, that is the reason they are kept apart
 //
-// Kind 代表 HTTP 操作结果的分类
-// 用于将结果分类为可操作的组
+// Kind 表示请求故障的性质，让调用方能据此分支
+// 每个 kind 对应不同的补救方式，这也是把它们分开的理由
 type Kind string
 
+// Kinds produced from the built-in detection
+// 内置检测会产出的分类
 const (
-	// KindUnknown indicates unclassified issues
-	// KindUnknown 表示未分类的问题
+	// KindUnknown means the fault does not match any known shape
+	// Remedy: log it and look into it, the detection needs a fresh branch
+	//
+	// KindUnknown 表示故障不符合任何已知形态
+	// 补救：记录并排查，检测逻辑需要新增分支
 	KindUnknown Kind = "UNKNOWN"
 
-	// KindNetwork indicates network issues like timeout, DNS, TCP, TLS
-	// Outcomes: connection reset, deadline exceeded, no such host
-	// KindNetwork 表示网络问题，如超时、DNS、TCP、TLS
-	// 结果：连接重置、截止时间超时、无此主机
+	// KindNetwork means the request never got a complete response: refused, reset, timeout
+	// Remedy: retrying makes sense, the peer might be back soon
+	//
+	// KindNetwork 表示请求没能拿到完整响应：连接被拒、连接重置、超时
+	// 补救：重试有意义，对端可能很快恢复
 	KindNetwork Kind = "NETWORK"
 
-	// KindHttp indicates HTTP status code issues (4xx/5xx)
-	// Outcomes: 429 rate limit, 500 issues, 502/503/504 upstream issues
-	// KindHttp 表示 HTTP 状态码问题（4xx/5xx）
-	// 结果：429 限流、500 问题、502/503/504 上游问题
-	KindHttp Kind = "HTTP"
+	// KindCanceled means the caller stopped it: context canceled
+	// Remedy: stop. The context is dead, a retry fails at once
+	//
+	// KindCanceled 表示调用方主动停止：context 被取消
+	// 补救：停手。context 已经死了，重试会立刻再次失败
+	KindCanceled Kind = "CANCELED"
 
-	// KindParse indicates response parsing issues
-	// Outcomes: JSON unmarshal failed, unexpected content type
-	// KindParse 表示响应解析问题
-	// 结果：JSON 反序列化失败、意外的内容类型
-	KindParse Kind = "PARSE"
+	// KindRequest means the request itself cannot succeed: no such host, bad scheme, too many redirects
+	// Remedy: stop and fix the request. Retrying repeats the same mistake
+	//
+	// KindRequest 表示请求本身不可能成功：域名不存在、协议不支持、重定向次数超限
+	// 补救：停手并修请求。重试只是把同一个错误再犯一遍
+	KindRequest Kind = "REQUEST"
 
-	// KindBlock indicates request was blocked (captcha, WAF, login redirect)
-	// Outcomes: 403 with HTML, 200 with captcha page, redirect to login
-	// KindBlock 表示请求被阻止（验证码、WAF、登录重定向）
-	// 结果：403 带 HTML、200 带验证码页面、重定向到登录
-	KindBlock Kind = "BLOCK"
+	// KindTLS means the secure channel could not be established: untrusted cert, handshake denied
+	// Remedy: stop and fix trust settings. A cert does not become trusted through retries
+	//
+	// KindTLS 表示安全通道建立失败：证书不受信任、握手被拒
+	// 补救：停手并修信任配置。证书不会因为重试就变得可信
+	KindTLS Kind = "TLS"
 
-	// KindBusiness indicates business logic issues (HTTP 200 but business code != 0)
-	// Outcomes: rate limited, insufficient balance, invalid params
-	// KindBusiness 表示业务逻辑问题（HTTP 200 但业务码 != 0）
-	// 结果：限流、余额不足、参数无效
-	KindBusiness Kind = "BUSINESS"
+	// KindThrottle means the peer is rate limiting: HTTP 429
+	// Remedy: retry, and wait as long as the peer asks through Retry-After
+	//
+	// KindThrottle 表示对端在限流：HTTP 429
+	// 补救：重试，并按对端 Retry-After 要求的时长等待
+	KindThrottle Kind = "THROTTLE"
+
+	// KindUpstream means the serving side broke: HTTP 5xx
+	// Remedy: retry, unless the request is unsafe to send twice
+	//
+	// KindUpstream 表示服务端出问题：HTTP 5xx
+	// 补救：重试，除非该请求重复发送不安全
+	KindUpstream Kind = "UPSTREAM"
+
+	// KindClient means this side sent something the peer rejects: HTTP 4xx besides 429
+	// Remedy: stop and fix the request. The same request keeps being rejected
+	//
+	// KindClient 表示本方发出的东西被对端拒绝：除 429 外的 HTTP 4xx
+	// 补救：停手并修请求。同样的请求会一直被拒
+	KindClient Kind = "CLIENT"
 )
 
-// String returns the string representation of Kind
-// String 返回 Kind 的字符串表示
+// Kinds meant to come from a custom check: the built-in detection cannot see them
+// Reading a captcha page or a business code needs knowledge about the peer
+//
+// 以下分类由自定义检查产出：内置检测看不出来
+// 识别验证码页面或业务码需要关于对端的专门知识
+const (
+	// KindBlock means the peer served a captcha, a WAF page, or a login redirect
+	// Remedy: swap proxy, swap account, solve the captcha. Plain retries feed the block
+	//
+	// KindBlock 表示对端返回了验证码、WAF 拦截页或登录跳转
+	// 补救：换代理、换账号、过验证码。单纯重试只会喂大封禁
+	KindBlock Kind = "BLOCK"
+
+	// KindBusiness means HTTP said fine but the payload carries a business fault code
+	// Remedy: depends on the code, so the check decides whether a retry helps
+	//
+	// KindBusiness 表示 HTTP 说成功、但报文里带着业务失败码
+	// 补救：取决于业务码，因此由检查函数自行决定重试是否有用
+	KindBusiness Kind = "BUSINESS"
+
+	// KindParse means the payload could not be read as expected
+	// Remedy: usually stop, since the same bytes parse the same way
+	//
+	// KindParse 表示报文无法按预期解析
+	// 补救：通常停手，因为同样的字节解析结果不会变
+	KindParse Kind = "PARSE"
+)
+
+// String makes Kind print as its own name
+// String 让 Kind 按自身名称打印
 func (k Kind) String() string {
 	return string(k)
-}
-
-// IsUnknown checks if Kind indicates unknown issues
-// IsUnknown 检查 Kind 是否表示未知问题
-func (k Kind) IsUnknown() bool {
-	return k == KindUnknown
-}
-
-// IsNetwork checks if Kind indicates network issues
-// IsNetwork 检查 Kind 是否表示网络问题
-func (k Kind) IsNetwork() bool {
-	return k == KindNetwork
-}
-
-// IsHttp checks if Kind indicates HTTP status issues
-// IsHttp 检查 Kind 是否表示 HTTP 状态问题
-func (k Kind) IsHttp() bool {
-	return k == KindHttp
-}
-
-// IsParse checks if Kind indicates parsing issues
-// IsParse 检查 Kind 是否表示解析问题
-func (k Kind) IsParse() bool {
-	return k == KindParse
-}
-
-// IsBlock checks if Kind indicates blocked/captcha issues
-// IsBlock 检查 Kind 是否表示被阻止/验证码问题
-func (k Kind) IsBlock() bool {
-	return k == KindBlock
-}
-
-// IsBusiness checks if Kind indicates business logic issues
-// IsBusiness 检查 Kind 是否表示业务逻辑问题
-func (k Kind) IsBusiness() bool {
-	return k == KindBusiness
 }

@@ -13,140 +13,170 @@ import (
 	"github.com/yylego/restyoops"
 )
 
-// TestDetect_Success tests Detect returns nil on HTTP 200 success
-// TestDetect_Success 测试 Detect 在 HTTP 200 成功时返回 nil
-func TestDetect_Success(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"code":0,"msg":"ok"}`))
-	}))
-	defer server.Close()
-
-	client := resty.New()
-	resp, err := client.R().Get(server.URL)
-
-	oops := restyoops.Detect(restyoops.NewConfig(), resp, err)
-	require.Nil(t, oops) // success returns nil
+// causeOf sends a request that is meant to fail before a complete response arrives
+// causeOf 发出一个预期在完整响应到达前就失败的请求
+func causeOf(t *testing.T, client *resty.Client, url string) error {
+	t.Helper()
+	_, cause := client.R().Get(url)
+	require.Error(t, cause)
+	t.Logf("底层错误：%v", cause)
+	return cause
 }
 
-// TestDetect_HTTP500 tests Detect classifies HTTP 500 as retryable
-// TestDetect_HTTP500 测试 Detect 将 HTTP 500 分类为可重试
-func TestDetect_HTTP500(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
+// TestDetect_TrustFault keeps an untrusted certificate from being sent again
+// A certificate does not become trusted through repetition, so repeating only delays the failure
+//
+// TestDetect_TrustFault 确保不受信任的证书不会被重发
+// 证书不会因为重复就变得可信，重复只会推迟失败的到来
+func TestDetect_TrustFault(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer server.Close()
 
-	client := resty.New()
-	resp, err := client.R().Get(server.URL)
-
-	oops := restyoops.Detect(restyoops.NewConfig(), resp, err)
-	require.Equal(t, restyoops.KindHttp, oops.Kind)
-	require.Equal(t, 500, oops.StatusCode)
-	require.True(t, oops.Retryable)
-}
-
-// TestDetect_HTTP429 tests Detect classifies HTTP 429 as retryable
-// TestDetect_HTTP429 测试 Detect 将 HTTP 429 分类为可重试
-func TestDetect_HTTP429(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusTooManyRequests)
-	}))
-	defer server.Close()
-
-	client := resty.New()
-	resp, err := client.R().Get(server.URL)
-
-	oops := restyoops.Detect(restyoops.NewConfig(), resp, err)
-	require.Equal(t, restyoops.KindHttp, oops.Kind)
-	require.Equal(t, 429, oops.StatusCode)
-	require.True(t, oops.Retryable)
-}
-
-// TestDetect_HTTP404 tests Detect classifies HTTP 404 as not retryable
-// TestDetect_HTTP404 测试 Detect 将 HTTP 404 分类为不可重试
-func TestDetect_HTTP404(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	client := resty.New()
-	resp, err := client.R().Get(server.URL)
-
-	oops := restyoops.Detect(restyoops.NewConfig(), resp, err)
-	require.Equal(t, restyoops.KindHttp, oops.Kind)
-	require.Equal(t, 404, oops.StatusCode)
+	oops := restyoops.Detect(nil, causeOf(t, resty.New(), server.URL))
+	require.NotNil(t, oops)
+	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
+	require.Equal(t, restyoops.KindTLS, oops.Kind)
 	require.False(t, oops.Retryable)
 }
 
-// TestDetect_NetworkTimeout tests Detect classifies timeout as retryable network issue
-// TestDetect_NetworkTimeout 测试 Detect 将超时分类为可重试的网络问题
-func TestDetect_NetworkTimeout(t *testing.T) {
-	oops := restyoops.Detect(restyoops.NewConfig(), nil, context.DeadlineExceeded)
+// TestDetect_SchemeFault keeps an unsupported scheme from being sent again
+// TestDetect_SchemeFault 确保不支持的协议不会被重发
+func TestDetect_SchemeFault(t *testing.T) {
+	oops := restyoops.Detect(nil, causeOf(t, resty.New(), "xyz://example.com"))
+	require.NotNil(t, oops)
+	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
+	require.Equal(t, restyoops.KindRequest, oops.Kind)
+	require.False(t, oops.Retryable)
+}
+
+// TestDetect_MissingHost keeps a name that does not exist from being sent again
+// TestDetect_MissingHost 确保不存在的域名不会被重发
+func TestDetect_MissingHost(t *testing.T) {
+	oops := restyoops.Detect(nil, causeOf(t, resty.New(), "http://host-that-does-not-exist-8f2a.invalid"))
+	require.NotNil(t, oops)
+	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
+	require.Equal(t, restyoops.KindRequest, oops.Kind)
+	require.False(t, oops.Retryable)
+}
+
+// TestDetect_RefusedConnection sends a refused connection again, since the peer may come back
+// TestDetect_RefusedConnection 会重发被拒绝的连接，因为对端可能会恢复
+func TestDetect_RefusedConnection(t *testing.T) {
+	oops := restyoops.Detect(nil, causeOf(t, resty.New(), "http://127.0.0.1:1"))
+	require.NotNil(t, oops)
+	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
 	require.Equal(t, restyoops.KindNetwork, oops.Kind)
 	require.True(t, oops.Retryable)
 }
 
-// TestDetect_NetworkCanceled tests Detect classifies canceled as retryable network issue
-// TestDetect_NetworkCanceled 测试 Detect 将取消分类为可重试的网络问题
-func TestDetect_NetworkCanceled(t *testing.T) {
-	oops := restyoops.Detect(restyoops.NewConfig(), nil, context.Canceled)
+// TestDetect_Canceled stops once the caller called it off, since the context is already dead
+// TestDetect_Canceled 在调用方喊停后停手，因为 context 已经死了
+func TestDetect_Canceled(t *testing.T) {
+	oops := restyoops.Detect(nil, context.Canceled)
+	require.NotNil(t, oops)
+	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
+	require.Equal(t, restyoops.KindCanceled, oops.Kind)
+	require.False(t, oops.Retryable)
+}
+
+// TestDetect_DeadlineExceeded sends a timeout again, since time running out often clears up
+// TestDetect_DeadlineExceeded 会重发超时，因为时间用完这种情况常常会好转
+func TestDetect_DeadlineExceeded(t *testing.T) {
+	oops := restyoops.Detect(nil, context.DeadlineExceeded)
+	require.NotNil(t, oops)
+	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
 	require.Equal(t, restyoops.KindNetwork, oops.Kind)
 	require.True(t, oops.Retryable)
 }
 
-// TestDetect_UnknownError tests Detect classifies unknown errors as not retryable
-// TestDetect_UnknownError 测试 Detect 将未知错误分类为不可重试
-func TestDetect_UnknownError(t *testing.T) {
-	oops := restyoops.Detect(restyoops.NewConfig(), nil, errors.New("some unknown issue"))
+// TestDetect_UnknownCause gives up on a shape it cannot recognize
+// TestDetect_UnknownCause 对认不出的形态选择放弃
+func TestDetect_UnknownCause(t *testing.T) {
+	oops := restyoops.Detect(nil, errors.New("something nobody has seen"))
+	require.NotNil(t, oops)
+	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
 	require.Equal(t, restyoops.KindUnknown, oops.Kind)
 	require.False(t, oops.Retryable)
 }
 
-// TestConfig_Override403Retryable tests Config can override HTTP 403 to be retryable
-// TestConfig_Override403Retryable 测试 Config 可以覆盖 HTTP 403 为可重试
-func TestConfig_Override403Retryable(t *testing.T) {
+// respWith serves one status code and returns the response resty received
+// respWith 提供一个状态码，并返回 resty 收到的响应
+func respWith(t *testing.T, statusCode int, headers map[string]string) *resty.Response {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
+		for name, value := range headers {
+			w.Header().Set(name, value)
+		}
+		w.WriteHeader(statusCode)
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 
-	client := resty.New()
-	resp, err := client.R().Get(server.URL)
-
-	// Default: 403 not retryable
-	oops := restyoops.Detect(restyoops.NewConfig(), resp, err)
-	require.Equal(t, restyoops.KindHttp, oops.Kind)
-	require.False(t, oops.Retryable)
-
-	// Config override: 403 retryable with 2s wait
-	cfg := restyoops.NewConfig().WithStatusRetryable(403, true, 2*time.Second)
-	oops = restyoops.Detect(cfg, resp, err)
-	require.Equal(t, restyoops.KindHttp, oops.Kind)
-	require.True(t, oops.Retryable)
-	require.Equal(t, 2*time.Second, oops.WaitTime)
+	resp, cause := resty.New().R().Get(server.URL)
+	require.NoError(t, cause)
+	return resp
 }
 
-// TestConfig_Override500NotRetryable tests Config can override HTTP 500 to not be retryable
-// TestConfig_Override500NotRetryable 测试 Config 可以覆盖 HTTP 500 为不可重试
-func TestConfig_Override500NotRetryable(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
+// TestDetect_StatusKinds checks each status code lands in the kind matching its remedy
+// TestDetect_StatusKinds 检查每个状态码都落在与其补救方式相符的分类上
+func TestDetect_StatusKinds(t *testing.T) {
+	cases := []struct {
+		statusCode int
+		kind       restyoops.Kind
+		retryable  bool
+		reason     string
+	}{
+		{http.StatusOK, "", false, "成功不是故障"},
+		{http.StatusMovedPermanently, "", false, "重定向由 resty 处理，不算故障"},
+		{http.StatusBadRequest, restyoops.KindClient, false, "请求本身不对，重发还是不对"},
+		{http.StatusUnauthorized, restyoops.KindClient, false, "没有凭据，重发也没有"},
+		{http.StatusNotFound, restyoops.KindClient, false, "资源不在，重发也不会出现"},
+		{http.StatusRequestTimeout, restyoops.KindClient, true, "对端等烦了，再来一次即可"},
+		{http.StatusTooEarly, restyoops.KindClient, true, "对端说来早了，稍后再来"},
+		{http.StatusTooManyRequests, restyoops.KindThrottle, true, "限流，等够了再来"},
+		{http.StatusInternalServerError, restyoops.KindUpstream, true, "服务端出错，可能是一时的"},
+		{http.StatusNotImplemented, restyoops.KindUpstream, false, "对端根本没实现，重发无用"},
+		{http.StatusBadGateway, restyoops.KindUpstream, true, "网关故障，通常是一时的"},
+		{http.StatusServiceUnavailable, restyoops.KindUpstream, true, "服务不可用，通常是一时的"},
+	}
 
-	client := resty.New()
-	resp, err := client.R().Get(server.URL)
+	for _, c := range cases {
+		oops := restyoops.Detect(respWith(t, c.statusCode, nil), nil)
+		if c.kind == "" {
+			require.Nil(t, oops, "状态码 %d 不该被当成故障", c.statusCode)
+			t.Logf("%3d -> 无故障           （%s）", c.statusCode, c.reason)
+			continue
+		}
+		require.NotNil(t, oops, "状态码 %d 该被当成故障", c.statusCode)
+		require.Equal(t, c.kind, oops.Kind, "状态码 %d 分类不符", c.statusCode)
+		require.Equal(t, c.retryable, oops.Retryable, "状态码 %d 重试判断不符", c.statusCode)
+		require.Equal(t, c.statusCode, oops.StatusCode)
+		t.Logf("%3d -> %-8s 可重试=%-5v（%s）", c.statusCode, oops.Kind, oops.Retryable, c.reason)
+	}
+}
 
-	// Default: 500 retryable
-	oops := restyoops.Detect(restyoops.NewConfig(), resp, err)
-	require.True(t, oops.Retryable)
+// TestDetect_HonoursRetryAfter takes the wait the peer states rather than guessing one
+// TestDetect_HonoursRetryAfter 采用对端明确说明的等待时长，而不是自己猜一个
+func TestDetect_HonoursRetryAfter(t *testing.T) {
+	resp := respWith(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "120"})
 
-	// Config override: 500 not retryable
-	cfg := restyoops.NewConfig().WithStatusRetryable(500, false, 0)
-	oops = restyoops.Detect(cfg, resp, err)
-	require.False(t, oops.Retryable)
+	oops := restyoops.Detect(resp, nil)
+	require.NotNil(t, oops)
+	waitTime, stated := restyoops.WaitTimeOf(oops)
+	t.Logf("对端要求等待 %v（明确给出=%v）", waitTime, stated)
+	require.True(t, stated)
+	require.Equal(t, 120*time.Second, waitTime)
+}
+
+// TestDetect_KeepsVerdict returns the verdict it was handed rather than building a second one
+// This lets Detect sit anywhere in the flow without the risk of classifying the same fault twice
+//
+// TestDetect_KeepsVerdict 沿用交给它的结论，而不是再造一个
+// 这让 Detect 能放在流程的任何位置，而不必担心同一个故障被分类两次
+func TestDetect_KeepsVerdict(t *testing.T) {
+	first := restyoops.Detect(respWith(t, http.StatusInternalServerError, nil), nil)
+	require.NotNil(t, first)
+
+	again := restyoops.Detect(nil, first)
+	require.Same(t, first, again)
+	t.Logf("反复分类拿到的是同一个结论：%v", again)
 }
