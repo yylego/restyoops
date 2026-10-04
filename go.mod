@@ -1,6 +1,6 @@
 module github.com/yylego/restyoops
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/go-resty/resty/v2 v2.17.2
@@ -8,6 +8,6 @@ require (
 )
 
 require (
-	golang.org/x/net v0.51.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

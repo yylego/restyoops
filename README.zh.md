@@ -1,9 +1,13 @@
+<!-- TEMPLATE (ZH) BEGIN: BADGES -->
+
 [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/yylego/restyoops/release.yml?branch=main&label=BUILD)](https://github.com/yylego/restyoops/actions/workflows/release.yml?query=branch%3Amain)
 [![GoDoc](https://pkg.go.dev/badge/github.com/yylego/restyoops)](https://pkg.go.dev/github.com/yylego/restyoops)
 [![Coverage Status](https://img.shields.io/coveralls/github/yylego/restyoops/main.svg)](https://coveralls.io/github/yylego/restyoops?branch=main)
-[![Supported Go Versions](https://img.shields.io/badge/Go-1.25+-lightgrey.svg)](https://go.dev/)
+[![Supported Go Versions](https://img.shields.io/badge/Go-1.26%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/restyoops.svg)](https://github.com/yylego/restyoops/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/restyoops)](https://goreportcard.com/report/github.com/yylego/restyoops)
+
+<!-- TEMPLATE (ZH) CLOSE: BADGES -->
 
 # restyoops
 
@@ -21,25 +25,25 @@ Oops! 判断一次失败的 resty 请求是否值得再发一次。
 
 <!-- TEMPLATE (ZH) CLOSE: LANGUAGE NAVIGATION -->
 
-## 这个包解决什么问题
+## 职责与使用场景
 
-重试循环、指数退避、尝试计数，resty 本来就有。它留给使用方的是**判断本身**，而这部分不管的话会以很难察觉的方式出错。
+Resty 提供重试循环、退避算法和尝试计数。本包补充故障分类与重试规则。
 
-下面每一行都来自本仓库的测试，针对 resty v2.17.2 实测：
+以下列出 Resty v2.17.2 的内置行为：
 
-| 场景 | resty 自己的行为 |
-| ---- | ---------------- |
-| `SetRetryCount(3)`，对端返回 `500` | 对端只被访问 **1 次**。状态码从来不会被重试 |
-| 连接被拒绝 | 重试 4 次 ✅ |
-| 加上 `AddRetryAfterErrorCondition()` 后再遇连接被拒 | 重试 **0 次**。resty 自带的 helper 把传输层重试关掉了 |
-| 同一个 helper，对端返回 `404` | 被访问 **4 次**，为一个不会出现的资源反复敲对端 |
-| 对端返回 `429` 且 `Retry-After: 120` | **102ms** 后就重发。该头从来不会被读取 |
-| 证书不受信任 | 重试 4 次，尽管证书不会因为重试就变得可信 |
-| `POST` 收到 `500` | 会重试，尽管背后的订单可能已经下过了 |
+| 场景                                                | resty 自己的行为                         |
+| --------------------------------------------------- | ---------------------------------------- |
+| `SetRetryCount(3)`，对端返回 `500`                  | 未配置状态码重试条件时，只请求 1 次      |
+| 连接被拒绝，配置 `SetRetryCount(3)`                 | 最多请求 4 次                            |
+| 加上 `AddRetryAfterErrorCondition()` 后再遇连接被拒 | 该条件不会触发重试                       |
+| `AddRetryAfterErrorCondition()` 遇到 `404`          | 该条件会允许重试                         |
+| 对端返回 `429` 且 `Retry-After: 120`                | 需要配置回调来遵守要求的等待时间         |
+| 开启重试后遇到证书不受信任                          | 默认传输错误处理可能重复请求             |
+| `POST` 收到 `500`，且有匹配的重试条件               | 可能重复请求，尽管之前的操作可能已经生效 |
 
-第三行的成因：resty 每轮先假定传输故障要重试，然后让**每一个**条件去覆盖这个假定。因此只要有一个条件回答"否"，这个假定就被整个抹掉。
+第三行的成因：配置重试条件后，Resty 按顺序检查，遇到第一个 true 就重试；全部返回 false 时停止。因此，条件只判断 HTTP 状态码时，可能漏掉传输故障。
 
-本包补上这部分判断，一次调用即可装好，并把每个故障作为携带分类信息的 error 报出来。
+使用 `Detect` 对请求结果分类；使用 `Setup` 配置 Resty 的重试循环与响应检查。
 
 ## 安装
 
@@ -76,34 +80,34 @@ func main() {
 }
 ```
 
-`Setup` 把策略一次装到 client 上。之后每个调用点都是普通的 Go 代码：一个 `if err != nil` 同时兜住传输故障和故障状态码，需要分类信息时再用 `errors.As` 取出来。
+`Setup` 在使用 client 前安装一次，设置重试次数、等待和响应检查。其他条件即使放行，本包仍在 `RetryAfter` 阶段检查分类和等待预算；不要再覆盖该回调。状态码故障返回 `*Oops`；传输错误可能仍是 Resty 的原始错误，统一分类可以使用 `Detect(resp, err)`。如果其他条件要求重发成功响应，本包会返回冲突错误并停止。Resty 在没有响应对象时不会调用 `RetryAfter`，因此仍不建议混用额外重试条件。
 
-## 默认策略判什么
+## 默认分类与重试规则
 
 **传输层故障**
 
-| 故障 | 分类 | 是否重发 | 理由 |
-| ---- | ---- | -------- | ---- |
-| 连接被拒、被重置、不可达 | `KindNetwork` | 是 | 对端可能会恢复 |
-| 超时、截止时间用尽 | `KindNetwork` | 是 | 时间用完这种情况常常会好转 |
-| context 被取消 | `KindCanceled` | 否 | context 已经死了，再试一次会立刻再死 |
-| 域名解析不出来 | `KindRequest` | 否 | 不存在的域名会一直不存在 |
-| 协议不支持、缺少 host、重定向超限 | `KindRequest` | 否 | 请求本身永远迈不过去 |
-| 证书不受信任、握手被拒 | `KindTLS` | 否 | 信任不会通过重复而到来 |
-| 认不出的形态 | `KindUnknown` | 否 | 总好过为一个未知的东西反复敲对端 |
+| 故障                                            | 分类           | 是否重发 | 理由                      |
+| ----------------------------------------------- | -------------- | -------- | ------------------------- |
+| 连接被拒、被重置、不可达                        | `KindNetwork`  | 是       | 对端可能会恢复            |
+| 单次请求超时，未确认请求 context 已结束         | `KindNetwork`  | 是       | 由调用方结合总时限决定    |
+| context 被取消，或响应关联的请求 context 已过期 | `KindCanceled` | 否       | 相同 context 无法继续请求 |
+| DNS 确认域名不存在                              | `KindRequest`  | 否       | 检查域名                  |
+| 协议不支持、缺少 host、重定向超限               | `KindRequest`  | 否       | 检查请求配置              |
+| 证书校验或 TLS 记录格式错误                     | `KindTLS`      | 否       | 检查 TLS 配置             |
+| 未识别的错误                                    | `KindUnknown`  | 否       | 排查错误原因              |
 
 **状态码**
 
-| 状态码 | 分类 | 是否重发 |
-| ------ | ---- | -------- |
-| 408、425 | `KindClient` | 是 |
-| 429 | `KindThrottle` | 是，并按 `Retry-After` 要求的时长等待 |
-| 500、502、503、504 及其它 5xx | `KindUpstream` | 是 |
-| 501、505 | `KindUpstream` | 否 |
-| 400、401、403、404 及其它 4xx | `KindClient` | 否 |
-| 小于 400 | — | 不是故障，`Detect` 返回 nil |
+| 状态码                 | 分类           | 是否重发                              |
+| ---------------------- | -------------- | ------------------------------------- |
+| 408、425               | `KindClient`   | 是                                    |
+| 429                    | `KindThrottle` | 是，并按 `Retry-After` 要求的时长等待 |
+| 除 501、505 之外的 5xx | `KindUpstream` | 是                                    |
+| 501、505               | `KindUpstream` | 否                                    |
+| 其余 4xx               | `KindClient`   | 否                                    |
+| 小于 400               | —              | 不是故障，`Detect` 返回 nil           |
 
-**不安全的重发。** `GET HEAD OPTIONS TRACE PUT DELETE` 之外的方法可能已经生效了，而且没有任何状态码能说明它到底生效了没有。这类方法不会被重发，只有一个例外：`429` 表示对端是把请求挡回来的、根本没处理它，因此重发是安全的。想收回这个判断用 `WithRepeatMethods`。
+**请求方法。** 默认允许重试 `GET HEAD OPTIONS TRACE PUT DELETE`。其他方法即使收到 `429` 也不会自动重试；确认接口允许重复执行后，可用 `WithRepeatMethods` 替换允许的方法集合。没有请求信息时，分类结果无法替调用方判断接口是否允许重复执行。
 
 **自定义检查可以报出的分类。** `KindBlock`（验证码、WAF、登录跳转）、`KindBusiness`（200 之下的业务失败码）、`KindParse`。内置检测不会产出这些，因为识别它们需要关于对端的专门知识。`Kind` 是开放类型，自己定义一个分类同样能用。
 
@@ -116,19 +120,19 @@ client := restyoops.Setup(resty.New(),
     restyoops.WithStatus(403, restyoops.Again(5*time.Second)),
     restyoops.WithKind(restyoops.KindUpstream, restyoops.Abort()),
     restyoops.WithRepeatMethods("GET", "HEAD", "POST"),
-    restyoops.WithErrorOnFault(false),                  // 保持 resty 形态：500 伴随 nil 的 error 返回
+    restyoops.WithFaultAsOops(false),                   // 保持 Resty 形态：500 伴随 nil 的 error 返回
 )
 ```
 
-`Again()` 把等待交给退避算法，它会随尝试次数增长。`Again(d)` 明确给出等待时长，该时长不随次数变化。`Abort()` 拒绝再试。明确给出的时长会被原样保留，包括明确写下的 0 —— 但 resty 会把任何等待时长抬高到 `WithWaitTime` 设定的下限，这条限制本包无法解除。
+`Again()` 使用 Resty 的退避算法，`Again(d)` 给出固定等待，`Abort()` 停止重试。有效的 `Retry-After` 与固定等待取较大值，Resty 仍会应用等待下限。明确要求的等待超出 `WithWaitTime` 上限时，`Setup` 停止自动重试，不截短等待；`Detect` 保留原始建议，由业务决定是否延后处理。
 
-优先级：自定义检查高于一切，其次是针对单个状态码的规则，再次是覆盖整个分类的规则，最后是内置判断。
+请求取消或 context 结束时直接停止。其他情况依次采用已有的 `*Oops`、自定义检查、单个状态码规则、分类规则、内置判断。新分类还会应用请求方法限制和对端等待要求。
 
-有两条边界需要说明，免得配了半天其实悄悄没生效。`WithStatus` 和 `WithKind` 调整的是已有结论、而不是造出结论：它们只作用于已被判为故障的状态码，即 400 及以上；并且只作用于内置检测得出的结论，不作用于检查函数报出的结论——检查函数亲眼看过响应，它的结论原样作数。想把 200 或 302 变成故障，那是 `WithCheck` 的职责。
+`WithStatus` 调整状态码故障（400 及以上），`WithKind` 调整内置分类。自定义检查保留自己的规则，也可以识别 2xx/3xx 响应中的故障。
 
 ## 自定义检查
 
-检查函数能看到整个响应，因此头、报文和背后的请求都读得到。返回 nil 表示把决定权交还回去。
+检查函数接收响应和错误原因。响应可能为 nil 或不完整，读取前应检查对应字段。返回 nil 时继续后续检查；均未报告故障时使用内置检测。
 
 ```go
 client := restyoops.Setup(resty.New(),
@@ -147,13 +151,15 @@ client := restyoops.Setup(resty.New(),
 `Detect` 回答一次已完成的调用碰到了什么，而不接管重试。它直接接收 resty 调用的返回值，没出问题时返回 nil。
 
 ```go
-oops := restyoops.Detect(resty.New().R().Get(url))
+oops := restyoops.Detect(resty.New().R().Get(endpoint))
 if oops != nil {
     fmt.Println(oops.Kind, oops.Retryable, oops.WaitTime)
 }
 ```
 
-把它的输出再喂给它会得到同一个结论，因此放在流程的任何位置都安全。
+业务已有重试循环时使用此模式，不再调用 `Setup`，并确认 Resty 客户端未开启另一层重试。业务负责次数、总时限和可取消的等待；`Retryable` 是建议，不表示重试一定成功。`WaitTimeOf` 可区分未指定等待与明确指定零等待。没有请求信息时，业务还需要检查自身 context。
+
+已有的 `*Oops` 通常直接返回；请求 context 已结束时会改为停止结论。
 
 ## Oops 结构
 
@@ -166,7 +172,7 @@ type Oops struct {
     URL         string
     Attempt     int           // 这是第几次尝试产生的，从 1 开始
     Retryable   bool
-    WaitTime    time.Duration // 0 表示交给退避算法决定
+    WaitTime    time.Duration // 用 WaitTimeOf 区分未指定与零等待
     Cause       error         // 状态码已说明问题时可以为 nil
 }
 ```
@@ -237,6 +243,10 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 
 ---
 
+<!-- TEMPLATE (ZH) BEGIN: GITHUB STARS -->
+
 ## GitHub 标星点赞
 
-[![标星点赞](https://starchart.cc/yylego/restyoops.svg?variant=adaptive)](https://starchart.cc/yylego/restyoops)
+[![Stargazers](https://starchart.cc/yylego/restyoops.svg?variant=adaptive)](https://starchart.cc/yylego/restyoops)
+
+<!-- TEMPLATE (ZH) CLOSE: GITHUB STARS -->

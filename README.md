@@ -1,15 +1,19 @@
+<!-- TEMPLATE (EN) BEGIN: BADGES -->
+
 [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/yylego/restyoops/release.yml?branch=main&label=BUILD)](https://github.com/yylego/restyoops/actions/workflows/release.yml?query=branch%3Amain)
 [![GoDoc](https://pkg.go.dev/badge/github.com/yylego/restyoops)](https://pkg.go.dev/github.com/yylego/restyoops)
 [![Coverage Status](https://img.shields.io/coveralls/github/yylego/restyoops/main.svg)](https://coveralls.io/github/yylego/restyoops?branch=main)
-[![Supported Go Versions](https://img.shields.io/badge/Go-1.25+-lightgrey.svg)](https://go.dev/)
+[![Supported Go Versions](https://img.shields.io/badge/Go-1.26%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/restyoops.svg)](https://github.com/yylego/restyoops/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/restyoops)](https://goreportcard.com/report/github.com/yylego/restyoops)
 
+<!-- TEMPLATE (EN) CLOSE: BADGES -->
+
 # restyoops
 
-Oops! Decide whether a failed resty request is worth sending again.
+Oops! Detect faults in Resty requests and decide on repeats.
 
-Retry judgement for `go-resty/resty/v2`: whether to send it again, how long to hold off, and what kind of fault it was.
+Fault classification and repeat advice with `go-resty/resty/v2`.
 
 ---
 
@@ -23,23 +27,23 @@ Retry judgement for `go-resty/resty/v2`: whether to send it again, how long to h
 
 ## The Problem
 
-resty already owns a retry loop, an exponential backoff and the attempt counting. What it leaves to its users is the judgement, and left alone that judgement goes wrong in ways that are easy to miss.
+Resty provides loops, backoff and attempt counts. This package supplies fault classification and repeat rules.
 
-Each row below comes from a test in this repo, run against resty v2.17.2:
+The following cases describe Resty v2.17.2's built-in decisions:
 
-| What happens | resty on its own |
-| ------------ | ---------------- |
-| `SetRetryCount(3)` and the peer answers `500` | The peer is reached **once**. Status codes are never repeated |
-| The connection is refused | Repeated 4 times ✅ |
-| `AddRetryAfterErrorCondition()` added, then the connection is refused | Repeated **0** times. resty's own helper silences retries on transport faults |
-| Same helper, and the peer answers `404` | Reached **4** times, hammering a peer over a resource that stays absent |
-| The peer answers `429` with `Retry-After: 120` | Goes again after **102ms**. The header is never read |
-| An untrusted certificate | Repeated 4 times, though no certificate becomes trusted through repetition |
-| `POST` answered with `500` | Repeated, though the order behind it may already have been placed |
+| Scenario                                                  | Resty outcome                                                |
+| --------------------------------------------------------- | ------------------------------------------------------------ |
+| `SetRetryCount(3)` with HTTP `500`                        | One attempt without status-based conditions                  |
+| Refused connection with `SetRetryCount(3)`                | Up to 4 attempts                                             |
+| `AddRetryAfterErrorCondition()` with a refused connection | No repeats from this condition                               |
+| `AddRetryAfterErrorCondition()` with HTTP `404`           | Repeats are permitted                                        |
+| HTTP `429` with `Retry-After: 120`                        | Requires a configured callback to respect the requested wait |
+| Untrusted certificate with repeats enabled                | Default transport handling can repeat the failure            |
+| POST with HTTP `500` and a matching condition             | Can repeat despite possible side effects                     |
 
-The reason the third row happens: resty starts each round assuming a transport fault repeats, then lets **every** condition overwrite that assumption. One condition answering "no" silences it entirely.
+Resty checks conditions in sequence and repeats at the first true result. With no match, it stops. A condition that checks HTTP status alone can thus miss transport faults.
 
-This package supplies the judgement, installs it in one call, and reports each fault as an error carrying its classification.
+Use `Detect` to inspect outcomes; use `Setup` to configure Resty's loop and response checks.
 
 ## Installation
 
@@ -76,59 +80,59 @@ func main() {
 }
 ```
 
-`Setup` installs the policy onto the client once. Every call site stays ordinary Go: one `if err != nil` catches transport faults and fault status codes alike, and `errors.As` reaches the classification when it is wanted.
+Invoke `Setup` once before using the client. It configures counts, waits and response checks. The `RetryAfter` callback enforces the verdict and wait budget even if a separate condition accepts; do not replace it. Status faults return `*Oops`; transport faults can retain Resty's errors. Use `Detect(resp, err)` to inspect both. A condition that requests a repeat on success triggers a conflict error. Resty skips `RetryAfter` without a response object, so avoid mixing conditions.
 
-## What The Defaults Decide
+## Default Rules
 
 **Transport faults**
 
-| Fault | Kind | Send again | Why |
-| ----- | ---- | ---------- | --- |
-| Connection refused, reset, unreachable | `KindNetwork` | yes | The peer may come back |
-| Timeout, deadline exceeded | `KindNetwork` | yes | Time running out often clears up |
-| Context canceled | `KindCanceled` | no | The context is dead, another attempt dies at once |
-| Name does not resolve | `KindRequest` | no | Absent names stay absent |
-| Unsupported scheme, no host, too many redirects | `KindRequest` | no | The request itself can never get past this |
-| Untrusted certificate, denied handshake | `KindTLS` | no | Trust does not arrive through repetition |
-| Anything unrecognized | `KindUnknown` | no | Better than hammering a peer over an unknown shape |
+| Fault                                                    | Kind           | Send again | Reason                                |
+| -------------------------------------------------------- | -------------- | ---------- | ------------------------------------- |
+| Connection refused, reset, unreachable                   | `KindNetwork`  | yes        | Connection faults can be transient    |
+| Attempt timeout, request context not known to have ended | `KindNetwork`  | yes        | Subject to the business time budget   |
+| Canceled / expired request context                       | `KindCanceled` | no         | The same context cannot make progress |
+| DNS reports a missing name                               | `KindRequest`  | no         | Correct the hostname                  |
+| Unsupported scheme, missing host, redirect limit         | `KindRequest`  | no         | Correct the request                   |
+| Certificate validation / TLS record fault                | `KindTLS`      | no         | Inspect TLS settings                  |
+| Unrecognized cause                                       | `KindUnknown`  | no         | Inspect the cause                     |
 
 **Status codes**
 
-| Status | Kind | Send again |
-| ------ | ---- | ---------- |
-| 408, 425 | `KindClient` | yes |
-| 429 | `KindThrottle` | yes, holding off as `Retry-After` asks |
-| 500, 502, 503, 504, other 5xx | `KindUpstream` | yes |
-| 501, 505 | `KindUpstream` | no |
-| 400, 401, 403, 404, other 4xx | `KindClient` | no |
-| below 400 | — | not a fault, `Detect` returns nil |
+| Status              | Kind           | Send again                             |
+| ------------------- | -------------- | -------------------------------------- |
+| 408, 425            | `KindClient`   | yes                                    |
+| 429                 | `KindThrottle` | yes, holding off as `Retry-After` asks |
+| 5xx except 501, 505 | `KindUpstream` | yes                                    |
+| 501, 505            | `KindUpstream` | no                                     |
+| Remaining 4xx       | `KindClient`   | no                                     |
+| below 400           | —              | not a fault, `Detect` returns nil      |
 
-**Repeats that are not safe.** A method outside `GET HEAD OPTIONS TRACE PUT DELETE` may already have taken effect, and no status code can tell whether it did. Such a method is not repeated, with one exception: `429` means the peer turned the request away without acting on it, so repeating it is safe. `WithRepeatMethods` takes that decision back.
+**Request methods.** Defaults permit repeats with `GET HEAD OPTIONS TRACE PUT DELETE`. Methods outside this set do not repeat even on `429`. Use `WithRepeatMethods` to replace the set based on the endpoint's contract. Missing request metadata leaves method checks to business code.
 
-**Kinds a custom check can report.** `KindBlock` (captcha, WAF, login redirect), `KindBusiness` (a fault code inside a 200), `KindParse`. The built-in detection never produces these, since recognizing them needs knowledge about the peer. `Kind` is an open type, so a kind of your own works the same way.
+**Custom checks.** `KindBlock` (captcha, WAF, login redirect), `KindBusiness` (a fault code inside a 200) and `KindParse` need endpoint-specific knowledge. Built-in detection does not produce them. `Kind` also accepts custom values.
 
 ## Configuration
 
 ```go
 client := restyoops.Setup(resty.New(),
-    restyoops.WithAttempts(3),                          // attempts after the first
+    restyoops.WithAttempts(3),                          // repeats following the first attempt
     restyoops.WithWaitTime(100*time.Millisecond, 30*time.Second),
     restyoops.WithStatus(403, restyoops.Again(5*time.Second)),
     restyoops.WithKind(restyoops.KindUpstream, restyoops.Abort()),
     restyoops.WithRepeatMethods("GET", "HEAD", "POST"),
-    restyoops.WithErrorOnFault(false),                  // keep resty's shape: a 500 arrives with a nil error
+    restyoops.WithFaultAsOops(false),                   // preserve Resty's nil error on HTTP faults
 )
 ```
 
-`Again()` hands the wait to the backoff, which grows it with each attempt. `Again(d)` states the wait, which then stays flat. `Abort()` refuses another attempt. A stated wait is kept as stated, including a stated zero — though resty raises any wait up to the floor set through `WithWaitTime`, which is a limit this package cannot lift.
+`Again()` uses Resty's backoff, `Again(d)` states a fixed wait, and `Abort()` stops repeats. A valid `Retry-After` can increase the fixed wait; Resty also applies the minimum wait. When a stated wait exceeds the `WithWaitTime` maximum, `Setup` stops repeats. `Detect` preserves the wait so business code can reschedule the operation.
 
-Precedence: a custom check outranks everything, then a rule pinned to one status code, then a rule covering a kind, then the built-in decision.
+Cancellation / an ended request context stops the operation first. Precedence then follows: existing `*Oops`, custom check, status rule, kind rule, default decision. New verdicts also respect method restrictions and endpoint waits.
 
-Two boundaries worth stating, so nothing configured turns out to be quietly inert. `WithStatus` and `WithKind` refine a verdict rather than create one: they reach status codes already counted as faults, meaning 400 and above. And they reach the built-in detection's verdicts, not what a check reports — a check saw the response itself, so its verdict stands as given. Turning a 200 or a 302 into a fault is what `WithCheck` is there for.
+`WithStatus` applies to status faults (>= 400). `WithKind` adjusts built-in classifications. Custom checks retain explicit rules and can detect faults in 2xx/3xx responses.
 
 ## Custom Checks
 
-A check sees the whole response, so headers, payload and the request behind it are all reachable. Returning nil hands the decision back.
+A check receives the response and cause. The response can be absent / incomplete. A nil result proceeds to the next check; built-in detection runs if no check reports a fault.
 
 ```go
 client := restyoops.Setup(resty.New(),
@@ -142,18 +146,20 @@ client := restyoops.Setup(resty.New(),
 )
 ```
 
-## Classifying Without Taking Over
+## Classification Without Automatic Repeats
 
-`Detect` answers what a finished call ran into, leaving the retrying alone. It reads what a resty call returns, and returns nil when nothing went wrong.
+`Detect` classifies an attempt without sending requests / sleeping. A nil result denotes no fault.
 
 ```go
-oops := restyoops.Detect(resty.New().R().Get(url))
+oops := restyoops.Detect(resty.New().R().Get(endpoint))
 if oops != nil {
     fmt.Println(oops.Kind, oops.Retryable, oops.WaitTime)
 }
 ```
 
-Calling it again on its own output returns the same verdict, so it is safe anywhere in the flow.
+Use this mode with business-owned loops. Omit `Setup` and disable Resty's repeats. Business code owns counts, time budgets and cancelable waits. `Retryable` is advice, not a promise of success. `WaitTimeOf` distinguishes an absent wait from a stated zero. Without request metadata, business code must also check its context.
+
+An existing `*Oops` is returned as is unless the request context has ended.
 
 ## Oops
 
@@ -166,8 +172,8 @@ type Oops struct {
     URL         string
     Attempt     int           // Which attempt produced it, counting from 1
     Retryable   bool
-    WaitTime    time.Duration // 0 means the backoff decides
-    Cause       error         // nil when the status code says it much
+    WaitTime    time.Duration // Use WaitTimeOf to distinguish unset from zero
+    Cause       error         // Can be nil with status-based faults
 }
 ```
 
@@ -237,6 +243,10 @@ Welcome to contribute to this project via submitting merge requests and reportin
 
 ---
 
+<!-- TEMPLATE (EN) BEGIN: GITHUB STARS -->
+
 ## GitHub Stars
 
 [![Stargazers](https://starchart.cc/yylego/restyoops.svg?variant=adaptive)](https://starchart.cc/yylego/restyoops)
+
+<!-- TEMPLATE (EN) CLOSE: GITHUB STARS -->

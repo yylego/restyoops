@@ -12,22 +12,20 @@ import (
 	"strings"
 )
 
-// detectCause classifies a transport fault, one that kept a complete response from arriving
-// The branches run from precise to broad, since the broad shapes wrap the precise ones
-// Getting the order backwards hides every precise judgement behind the catch-all
+// detectCause classifies transport faults, testing specific causes before broad wrappers.
 //
 // detectCause 对传输层故障分类，即那些导致完整响应没能到达的故障
 // 分支从精确排到宽泛，因为宽泛的形态会把精确的包在里面
 // 顺序写反会让所有精确判断被兜底分支吃掉
 func detectCause(cause error) *Oops {
-	// The caller called it off, so the context is dead and another attempt dies at once
-	// 调用方喊停，context 已经死了，再试一次会立刻再死
+	// Cancellation prevents progress with the same context.
+	// 请求 context 已取消，停止继续尝试。
 	if errors.Is(cause, context.Canceled) {
 		return NewOops(KindCanceled, cause, Abort())
 	}
 
-	// Ran out of time, which often clears up, so another attempt is worth it
-	// 时间用完了，这种情况常常会好转，值得再试
+	// An attempt timeout can be transient if the request context remains active.
+	// 单次超时可能是暂时故障；请求 context 已结束的情况由 Detect 先行处理。
 	if errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, os.ErrDeadlineExceeded) {
 		return NewOops(KindNetwork, cause, Again())
 	}
@@ -38,7 +36,7 @@ func detectCause(cause error) *Oops {
 		return NewOops(KindTLS, cause, Abort())
 	}
 
-	// The name does not resolve. Absent names stay absent, other lookup faults may clear up
+	// Missing DNS names need correction; transient lookup faults can resolve.
 	// 域名解析不了。不存在的域名会一直不存在，其它解析故障则可能好转
 	var dnsFault *net.DNSError
 	if errors.As(cause, &dnsFault) {
@@ -48,21 +46,20 @@ func detectCause(cause error) *Oops {
 		return NewOops(KindNetwork, cause, Again())
 	}
 
-	// The connection itself failed: refused, reset, unreachable. The peer may come back
+	// Connection faults can be transient.
 	// 连接本身失败：被拒、被重置、不可达。对端可能会回来
 	var opFault *net.OpError
 	if errors.As(cause, &opFault) {
 		return NewOops(KindNetwork, cause, Again())
 	}
 
-	// net/http wraps every transport fault in url.Error, so it arrives last on purpose
-	// Some of what it carries can never succeed, and those must not be sent again
+	// Inspect url.Error once specific causes have been checked.
 	//
 	// net/http 会把所有传输故障包进 url.Error，因此它被有意排在最后
 	// 它携带的部分故障永远不可能成功，那些绝不能再发一次
-	var urlFault *url.Error
-	if errors.As(cause, &urlFault) {
-		if isRequestFault(urlFault) {
+	var linkFault *url.Error
+	if errors.As(cause, &linkFault) {
+		if isRequestFault(linkFault) {
 			return NewOops(KindRequest, cause, Abort())
 		}
 		return NewOops(KindNetwork, cause, Again())
@@ -75,24 +72,24 @@ func detectCause(cause error) *Oops {
 		return NewOops(KindNetwork, cause, Again())
 	}
 
-	// Shape unknown, so giving up beats hammering a peer over something unrecognized
+	// Unrecognized causes need investigation before repeats.
 	// 形态未知，与其为一个认不出的东西反复敲对端，不如放弃
 	return NewOops(KindUnknown, cause, Abort())
 }
 
-// isTrustFault reports whether the secure channel could not be established
+// isTrustFault detects certificate and TLS record faults.
 // isTrustFault 判断安全通道是否建立失败
 func isTrustFault(cause error) bool {
-	var verifyFault *tls.CertificateVerificationError
-	if errors.As(cause, &verifyFault) {
+	var certFault *tls.CertificateVerificationError
+	if errors.As(cause, &certFault) {
 		return true
 	}
 	var recordFault tls.RecordHeaderError
 	if errors.As(cause, &recordFault) {
 		return true
 	}
-	var authorityFault x509.UnknownAuthorityError
-	if errors.As(cause, &authorityFault) {
+	var certTrustFault x509.UnknownAuthorityError
+	if errors.As(cause, &certTrustFault) {
 		return true
 	}
 	var hostnameFault x509.HostnameError
@@ -103,19 +100,18 @@ func isTrustFault(cause error) bool {
 	return errors.As(cause, &invalidFault)
 }
 
-// isRequestFault reports whether a url.Error carries something the request can never get past
-// The standard library states these through plain text, so matching the text is the way in
+// isRequestFault detects request faults expressed through net/http's fixed messages.
 //
 // isRequestFault 判断 url.Error 携带的是不是请求本身永远迈不过去的问题
 // 标准库用纯文本表达这些故障，因此只能通过匹配文本识别
-func isRequestFault(urlFault *url.Error) bool {
-	if urlFault.Err == nil {
+func isRequestFault(linkFault *url.Error) bool {
+	if linkFault.Err == nil {
 		return false
 	}
-	if urlFault.Timeout() {
+	if linkFault.Timeout() {
 		return false
 	}
-	text := urlFault.Err.Error()
+	text := linkFault.Err.Error()
 	for _, mark := range []string{
 		"unsupported protocol scheme",
 		"no Host in request URL",
@@ -142,27 +138,27 @@ func detectStatus(statusCode int) *Oops {
 // detectStatusKind 根据状态码选出分类和处置规则
 func detectStatusKind(statusCode int) *Oops {
 	switch {
-	// The peer is rate limiting, and it commonly states how long to hold off
+	// Rate limits can include a minimum wait.
 	// 对端在限流，而且通常会说明该停多久
 	case statusCode == http.StatusTooManyRequests:
 		return NewOops(KindThrottle, nil, Again())
 
-	// The peer gave up waiting, or asked to come back later, so coming back works
-	// 对端等烦了，或者请求稍后再来，那就再来一次
+	// These status codes can permit a repeat with suitable request semantics.
+	// 这些状态码允许结合请求语义考虑重试。
 	case statusCode == http.StatusRequestTimeout, statusCode == http.StatusTooEarly:
 		return NewOops(KindClient, nil, Again())
 
-	// The peer will never support it, so the same request stays unsupported
-	// 对端永远不会支持，同样的请求会一直不被支持
+	// Unsupported operations need request changes.
+	// 不支持的操作需要调整请求。
 	case statusCode == http.StatusNotImplemented, statusCode == http.StatusHTTPVersionNotSupported:
 		return NewOops(KindUpstream, nil, Abort())
 
-	// The serving side broke, which is the case retries were invented for
+	// Upstream faults can be transient.
 	// 服务端出了问题，这正是重试机制存在的理由
 	case statusCode >= 500:
 		return NewOops(KindUpstream, nil, Again())
 
-	// This side sent something the peer rejects, and it keeps rejecting it
+	// Remaining 4xx codes default to no repeats.
 	// 本方发出的东西被对端拒绝，而且会一直被拒绝
 	case statusCode >= 400:
 		return NewOops(KindClient, nil, Abort())

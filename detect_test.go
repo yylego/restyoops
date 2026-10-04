@@ -13,23 +13,23 @@ import (
 	"github.com/yylego/restyoops"
 )
 
-// causeOf sends a request that is meant to fail before a complete response arrives
+// causeOf obtains a transport fault from a request.
 // causeOf 发出一个预期在完整响应到达前就失败的请求
-func causeOf(t *testing.T, client *resty.Client, url string) error {
+func causeOf(t *testing.T, client *resty.Client, endpoint string) error {
 	t.Helper()
-	_, cause := client.R().Get(url)
+	_, cause := client.R().Get(endpoint)
 	require.Error(t, cause)
 	t.Logf("底层错误：%v", cause)
 	return cause
 }
 
 // TestDetect_TrustFault keeps an untrusted certificate from being sent again
-// A certificate does not become trusted through repetition, so repeating only delays the failure
+// Repetition cannot establish trust in a certificate.
 //
 // TestDetect_TrustFault 确保不受信任的证书不会被重发
 // 证书不会因为重复就变得可信，重复只会推迟失败的到来
 func TestDetect_TrustFault(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
 	defer server.Close()
 
 	oops := restyoops.Detect(nil, causeOf(t, resty.New(), server.URL))
@@ -59,7 +59,7 @@ func TestDetect_MissingHost(t *testing.T) {
 	require.False(t, oops.Retryable)
 }
 
-// TestDetect_RefusedConnection sends a refused connection again, since the peer may come back
+// TestDetect_RefusedConnection permits repeats on refused connections.
 // TestDetect_RefusedConnection 会重发被拒绝的连接，因为对端可能会恢复
 func TestDetect_RefusedConnection(t *testing.T) {
 	oops := restyoops.Detect(nil, causeOf(t, resty.New(), "http://127.0.0.1:1"))
@@ -69,14 +69,52 @@ func TestDetect_RefusedConnection(t *testing.T) {
 	require.True(t, oops.Retryable)
 }
 
-// TestDetect_Canceled stops once the caller called it off, since the context is already dead
-// TestDetect_Canceled 在调用方喊停后停手，因为 context 已经死了
+// TestDetect_Canceled stops on context cancellation.
+// TestDetect_Canceled 在请求 context 取消后停止重试。
 func TestDetect_Canceled(t *testing.T) {
 	oops := restyoops.Detect(nil, context.Canceled)
 	require.NotNil(t, oops)
 	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
 	require.Equal(t, restyoops.KindCanceled, oops.Kind)
 	require.False(t, oops.Retryable)
+}
+
+func TestDetect_ContextStopsRules(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	stop()
+	resp := &resty.Response{Request: resty.New().R().SetContext(ctx)}
+	detective := restyoops.NewDetective(
+		restyoops.WithKind(restyoops.KindCanceled, restyoops.Again()),
+		restyoops.WithCheck(func(*resty.Response, error) *restyoops.Oops {
+			return restyoops.NewOops(restyoops.KindBusiness, nil, restyoops.Again())
+		}),
+	)
+	for _, item := range []struct {
+		resp  *resty.Response
+		cause error
+	}{
+		{nil, context.Canceled},
+		{resp, restyoops.NewOops(restyoops.KindNetwork, context.DeadlineExceeded, restyoops.Again())},
+	} {
+		oops := detective.Detect(item.resp, item.cause)
+		require.Equal(t, restyoops.KindCanceled, oops.Kind)
+		require.False(t, oops.Retryable)
+		require.ErrorIs(t, oops, context.Canceled)
+	}
+	ctx, stop = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+	resp.Request.SetContext(ctx)
+	oops := detective.Detect(resp, context.DeadlineExceeded)
+	require.False(t, oops.Retryable)
+	require.ErrorIs(t, oops, context.DeadlineExceeded)
+}
+
+func TestDetect_RespectsEndpointWait(t *testing.T) {
+	resp := respWith(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "120"})
+	for _, wait := range []time.Duration{time.Second, 3 * time.Minute} {
+		oops := restyoops.NewDetective(restyoops.WithStatus(http.StatusTooManyRequests, restyoops.Again(wait))).Detect(resp, nil)
+		require.Equal(t, max(wait, 2*time.Minute), oops.WaitTime)
+	}
 }
 
 // TestDetect_DeadlineExceeded sends a timeout again, since time running out often clears up
@@ -92,7 +130,7 @@ func TestDetect_DeadlineExceeded(t *testing.T) {
 // TestDetect_UnknownCause gives up on a shape it cannot recognize
 // TestDetect_UnknownCause 对认不出的形态选择放弃
 func TestDetect_UnknownCause(t *testing.T) {
-	oops := restyoops.Detect(nil, errors.New("something nobody has seen"))
+	oops := restyoops.Detect(nil, errors.New("unrecognized fault"))
 	require.NotNil(t, oops)
 	t.Logf("分类=%s 可重试=%v", oops.Kind, oops.Retryable)
 	require.Equal(t, restyoops.KindUnknown, oops.Kind)
@@ -103,7 +141,7 @@ func TestDetect_UnknownCause(t *testing.T) {
 // respWith 提供一个状态码，并返回 resty 收到的响应
 func respWith(t *testing.T, statusCode int, headers map[string]string) *resty.Response {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		for name, value := range headers {
 			w.Header().Set(name, value)
 		}
@@ -116,7 +154,7 @@ func respWith(t *testing.T, statusCode int, headers map[string]string) *resty.Re
 	return resp
 }
 
-// TestDetect_StatusKinds checks each status code lands in the kind matching its remedy
+// TestDetect_StatusKinds checks status-based classifications.
 // TestDetect_StatusKinds 检查每个状态码都落在与其补救方式相符的分类上
 func TestDetect_StatusKinds(t *testing.T) {
 	cases := []struct {
@@ -154,9 +192,9 @@ func TestDetect_StatusKinds(t *testing.T) {
 	}
 }
 
-// TestDetect_HonoursRetryAfter takes the wait the peer states rather than guessing one
-// TestDetect_HonoursRetryAfter 采用对端明确说明的等待时长，而不是自己猜一个
-func TestDetect_HonoursRetryAfter(t *testing.T) {
+// TestDetect_ExplicitWait preserves the endpoint's stated wait.
+// TestDetect_ExplicitWait 采用对端明确说明的等待时长。
+func TestDetect_ExplicitWait(t *testing.T) {
 	resp := respWith(t, http.StatusTooManyRequests, map[string]string{"Retry-After": "120"})
 
 	oops := restyoops.Detect(resp, nil)
@@ -167,8 +205,7 @@ func TestDetect_HonoursRetryAfter(t *testing.T) {
 	require.Equal(t, 120*time.Second, waitTime)
 }
 
-// TestDetect_KeepsVerdict returns the verdict it was handed rather than building a second one
-// This lets Detect sit anywhere in the flow without the risk of classifying the same fault twice
+// TestDetect_KeepsVerdict reuses an existing classification.
 //
 // TestDetect_KeepsVerdict 沿用交给它的结论，而不是再造一个
 // 这让 Detect 能放在流程的任何位置，而不必担心同一个故障被分类两次

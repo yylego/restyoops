@@ -5,14 +5,12 @@ import (
 	"time"
 )
 
-// TestParseRetryAfter covers both shapes the header comes in, plus the contents to ignore
-// A peer stating how long to hold off is the one authoritative answer available, so reading it
-// wrong in either direction hurts: too short keeps hammering, too long stalls the caller
+// TestParseWaitDuration checks seconds, dates and invalid values.
 //
-// TestParseRetryAfter 覆盖该头的两种写法，以及应当忽略的内容
+// TestParseWaitDuration 覆盖该头的两种写法，以及应当忽略的内容
 // 对端说明该停多久是唯一权威的答案，因此两个方向读错都有害：
 // 读短了会继续猛敲对端，读长了会让调用方空等
-func TestParseRetryAfter(t *testing.T) {
+func TestParseWaitDuration(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
 	cases := []struct {
@@ -32,7 +30,7 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		waitTime, stated := readRetryAfter(c.value, now)
+		waitTime, stated := parseWaitDuration(c.value, now)
 		if stated != c.stated || waitTime != c.waitTime {
 			t.Fatalf("值 %q 解析为 (%v, %v)，期望 (%v, %v)", c.value, waitTime, stated, c.waitTime, c.stated)
 		}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"time"
@@ -12,10 +13,10 @@ import (
 	"github.com/yylego/restyoops"
 )
 
-// Setup installs the policy once, leaving each call site to read like ordinary Go
+// Setup configures a client once; requests then return classified faults.
 // Setup 一次装好策略，让每个调用点读起来就是普通的 Go 代码
 func ExampleSetup() {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
@@ -40,12 +41,14 @@ func ExampleSetup() {
 	// 尝试次数: 3
 }
 
-// A check reads what the status code hides, since only the caller knows the peer
+// Custom checks interpret endpoint-specific response content.
 // 检查函数读出状态码掩盖的东西，因为只有调用方了解对端
 func ExampleWithCheck() {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`<html>please solve the captcha</html>`))
+		if _, err := w.Write([]byte(`<html>please solve the captcha</html>`)); err != nil {
+			log.Printf("RESPONSE WRITE: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -76,10 +79,10 @@ func ExampleWithCheck() {
 	// 原因: captcha page served
 }
 
-// Detect answers what a finished call ran into, without taking over the retrying
+// Detect classifies outcomes without repeating requests.
 // Detect 回答一次已完成的调用碰到了什么，而不接管重试
 func ExampleDetect() {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "30")
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))

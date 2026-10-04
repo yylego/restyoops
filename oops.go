@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// Oops describes one request fault: what happened, and whether sending it again makes sense
-// Oops is an error, so it travels through the usual error paths and answers errors.As
+// Oops describes a request fault and the advice on repeats.
+// Oops implements error and supports errors.As.
 //
 // Oops 描述一次请求故障：发生了什么，以及再发一次是否有意义
 // Oops 本身就是 error，因此能走通常的错误链路，也能被 errors.As 取出
@@ -18,19 +18,17 @@ type Oops struct {
 	Method      string        // Request method // 请求方法
 	URL         string        // Request URL // 请求 URL
 	Attempt     int           // Which attempt produced it, counting from 1 // 这是第几次尝试产生的，从 1 开始
-	Retryable   bool          // Whether sending it again makes sense // 再发一次是否有意义
-	WaitTime    time.Duration // Wait this long before the next attempt, 0 means use the backoff // 下次尝试前等这么久，0 表示交给退避算法
-	Cause       error         // Underlying cause, nil when the status code says it much // 底层原因，状态码已说明问题时可以为 nil
+	Retryable   bool          // Permits repeats subject to business limits. // 再发一次是否有意义
+	WaitTime    time.Duration // Requested wait; use WaitTimeOf to distinguish unset from zero // 建议等待时长；用 WaitTimeOf 区分未指定与零等待
+	Cause       error         // Underlying cause; can be nil with status-based faults // 底层原因；状态码故障可以为 nil
 
-	// fixedWait marks that the wait was stated on purpose, which keeps a deliberate zero
-	// apart from an absent one, and keeps a stated wait from being overwritten downstream
+	// fixedWait distinguishes an explicit zero from an unspecified wait.
 	//
 	// fixedWait 标记等待时长是被有意给出的，用来把"故意写 0"和"没写"区分开
-	// 也用来防止已经给定的等待时长在后续环节被覆盖掉
 	fixedWait bool
 }
 
-// NewOops builds an Oops, meant for custom checks that see faults the built-in detection cannot
+// NewOops builds an Oops to express faults found in custom checks.
 // Without a rule the fault counts as not retryable, since giving up is the safe default
 //
 // NewOops 构造一个 Oops，供自定义检查使用，用来表达内置检测看不出的故障

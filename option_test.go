@@ -15,21 +15,21 @@ import (
 // TestOption_StatusOutranksKind lets a rule pinned to one status code overrule its kind
 // TestOption_StatusOutranksKind 让针对单个状态码的规则压过其所属分类
 func TestOption_StatusOutranksKind(t *testing.T) {
-	url, count := serveStatus(t, http.StatusForbidden, nil)
+	endpoint, count := serveStatus(t, http.StatusForbidden, nil)
 
 	plain := restyoops.Setup(resty.New(), quick()...)
-	_, cause := plain.R().Get(url)
+	_, cause := plain.R().Get(endpoint)
 	require.Error(t, cause)
 	t.Logf("默认下 403 被访问 %d 次", count.hits.Load())
 	require.Equal(t, int32(1), count.hits.Load())
 
-	// A peer answering 403 while it warms up deserves another chance, unlike a plain refusal
+	// An endpoint contract can define a transient 403 response during startup.
 	// 对端在预热期间返回 403 时值得再给一次机会，这跟单纯的拒绝不同
 	count.hits.Store(0)
 	patient := restyoops.Setup(resty.New(), quick(
 		restyoops.WithStatus(http.StatusForbidden, restyoops.Again(time.Millisecond)),
 	)...)
-	_, cause = patient.R().Get(url)
+	_, cause = patient.R().Get(endpoint)
 	require.Error(t, cause)
 	t.Logf("改规则后 403 被访问 %d 次", count.hits.Load())
 	require.Equal(t, int32(4), count.hits.Load())
@@ -38,25 +38,24 @@ func TestOption_StatusOutranksKind(t *testing.T) {
 // TestOption_KindCoversWholeGroup decides a whole kind of fault in one stroke
 // TestOption_KindCoversWholeGroup 一笔决定一整类故障
 func TestOption_KindCoversWholeGroup(t *testing.T) {
-	url, count := serveStatus(t, http.StatusBadGateway, nil)
+	endpoint, count := serveStatus(t, http.StatusBadGateway, nil)
 
 	client := restyoops.Setup(resty.New(), quick(
 		restyoops.WithKind(restyoops.KindUpstream, restyoops.Abort()),
 	)...)
-	_, cause := client.R().Get(url)
+	_, cause := client.R().Get(endpoint)
 	require.Error(t, cause)
 
 	t.Logf("整类叫停后 502 被访问 %d 次", count.hits.Load())
 	require.Equal(t, int32(1), count.hits.Load())
 }
 
-// TestOption_CheckSeesPayload finds a fault the status code hides, which is the case checks exist for
-// A peer serving a captcha page under 200 looks like success to anything reading status alone
+// TestOption_CheckSeesPayload detects a captcha despite HTTP 200.
 //
 // TestOption_CheckSeesPayload 发现状态码掩盖住的故障，这正是检查函数存在的理由
 // 对端在 200 之下返回验证码页面时，任何只看状态码的判断都会当成成功
 func TestOption_CheckSeesPayload(t *testing.T) {
-	url, count := serveCaptcha(t)
+	endpoint, count := serveCaptcha(t)
 
 	client := restyoops.Setup(resty.New(), quick(
 		restyoops.WithCheck(func(resp *resty.Response, _ error) *restyoops.Oops {
@@ -71,7 +70,7 @@ func TestOption_CheckSeesPayload(t *testing.T) {
 		}),
 	)...)
 
-	resp, cause := client.R().Get(url)
+	resp, cause := client.R().Get(endpoint)
 	require.Error(t, cause, "200 之下的验证码页面也要被认出来")
 
 	var oops *restyoops.Oops
@@ -83,13 +82,12 @@ func TestOption_CheckSeesPayload(t *testing.T) {
 	require.Equal(t, int32(1), count.hits.Load(), "叫停之后不该再敲对端")
 }
 
-// TestOption_CheckCanSeeHeaders proves a check reaches the whole response, headers included
-// The old shape passed only content type and payload, hiding the headers that carry the answer
+// TestOption_CheckCanSeeHeaders inspects response metadata in a custom check.
 //
 // TestOption_CheckCanSeeHeaders 证明检查函数能看到整个响应，包括头
 // 旧的签名只传了内容类型和报文，把携带答案的那些头挡在了外面
 func TestOption_CheckCanSeeHeaders(t *testing.T) {
-	url, _ := serveStatus(t, http.StatusOK, map[string]string{"X-Quota-State": "drained"})
+	endpoint, _ := serveStatus(t, http.StatusOK, map[string]string{"X-Quota-State": "drained"})
 
 	client := restyoops.Setup(resty.New(), quick(
 		restyoops.WithCheck(func(resp *resty.Response, _ error) *restyoops.Oops {
@@ -101,40 +99,37 @@ func TestOption_CheckCanSeeHeaders(t *testing.T) {
 		}),
 	)...)
 
-	_, cause := client.R().Get(url)
+	_, cause := client.R().Get(endpoint)
 	require.Error(t, cause)
 	t.Logf("从响应头认出了：%v", cause)
 }
 
-// TestOption_CustomKind accepts a kind this package never heard of
-// The old shape refused anything outside its own list by panicking on the caller
+// TestOption_CustomKind accepts endpoint-specific kinds.
 //
 // TestOption_CustomKind 接受本包从未听说过的分类
 // 旧的写法对自己清单之外的任何分类都直接朝调用方 panic
 func TestOption_CustomKind(t *testing.T) {
-	const kindProxy = restyoops.Kind("PROXY")
+	const kindCustom = restyoops.Kind("CUSTOM")
 
-	url, count := serveStatus(t, http.StatusOK, nil)
+	endpoint, count := serveStatus(t, http.StatusOK, nil)
 	client := restyoops.Setup(resty.New(), quick(
 		restyoops.WithCheck(func(_ *resty.Response, _ error) *restyoops.Oops {
-			return restyoops.NewOops(kindProxy, errors.New("proxy went stale"),
+			return restyoops.NewOops(kindCustom, errors.New("resource not available"),
 				restyoops.Again(time.Millisecond))
 		}),
 	)...)
 
-	_, cause := client.R().Get(url)
+	_, cause := client.R().Get(endpoint)
 	require.Error(t, cause)
 
 	var oops *restyoops.Oops
 	require.True(t, errors.As(cause, &oops))
 	t.Logf("自定义分类 %s 正常工作，重发 %d 次", oops.Kind, count.hits.Load()-1)
-	require.Equal(t, kindProxy, oops.Kind)
+	require.Equal(t, kindCustom, oops.Kind)
 	require.Equal(t, int32(4), count.hits.Load())
 }
 
-// TestOption_StatedZeroSurvives tells a deliberate zero wait apart from an absent one
-// The old shape read a stated zero as "nothing set" and quietly substituted its own default,
-// leaving a caller who asked for the shortest wait with no way to say so
+// TestOption_StatedZeroSurvives distinguishes zero from an unspecified wait.
 //
 // TestOption_StatedZeroSurvives 把"故意写 0"和"没写"区分开
 // 旧的写法把明确写下的 0 读作"没设置"，然后悄悄换成了自己的默认值，
@@ -159,10 +154,10 @@ func TestOption_StatedZeroSurvives(t *testing.T) {
 	require.Equal(t, time.Duration(0), waitTime)
 }
 
-// TestOption_StatedWaitStaysFlat holds a stated wait steady rather than growing it each attempt
+// TestOption_StatedWaitStaysFlat checks fixed waits across attempts.
 // TestOption_StatedWaitStaysFlat 让给定的等待时长保持不变，而不是每次尝试都增长
 func TestOption_StatedWaitStaysFlat(t *testing.T) {
-	url, count := serveStatus(t, http.StatusInternalServerError, nil)
+	endpoint, count := serveStatus(t, http.StatusInternalServerError, nil)
 
 	client := restyoops.Setup(resty.New(),
 		restyoops.WithAttempts(3),
@@ -171,7 +166,7 @@ func TestOption_StatedWaitStaysFlat(t *testing.T) {
 	)
 
 	since := time.Now()
-	_, cause := client.R().Get(url)
+	_, cause := client.R().Get(endpoint)
 	elapsed := time.Since(since)
 	require.Error(t, cause)
 
@@ -184,10 +179,10 @@ func TestOption_StatedWaitStaysFlat(t *testing.T) {
 // TestOption_NoAttempts sends the request once and lets its verdict stand
 // TestOption_NoAttempts 只发一次请求，结果就是最终结果
 func TestOption_NoAttempts(t *testing.T) {
-	url, count := serveStatus(t, http.StatusInternalServerError, nil)
+	endpoint, count := serveStatus(t, http.StatusInternalServerError, nil)
 
 	client := restyoops.Setup(resty.New(), restyoops.WithAttempts(0))
-	_, cause := client.R().Get(url)
+	_, cause := client.R().Get(endpoint)
 	require.Error(t, cause)
 
 	t.Logf("不重试时被访问 %d 次", count.hits.Load())
